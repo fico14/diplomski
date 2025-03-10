@@ -967,7 +967,7 @@ static void* socket_thread_fn(void *arg)
 	bzero(buff, 20);
 	fprintf(stderr, "Main socket started listening on port: %d!\n", PORT);
 
-	while (do_exit) {
+	while (!do_exit) {
 		int ret = recv(sockfd, buff, sizeof(buff), 0);
 		if (ret < 0) {
 			fprintf(stderr, "Error while receiving packet, %d\n", errno);
