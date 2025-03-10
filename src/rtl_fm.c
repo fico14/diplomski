@@ -53,6 +53,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -172,6 +177,10 @@ struct controller_state
 	pthread_cond_t hop;
 	pthread_mutex_t hop_m;
 };
+
+pthread_t sock_thread;
+#define PORT 	6020
+volatile int mijenjam_frekvenciju = 0;
 
 // multiple of these, eventually
 struct dongle_state dongle;
@@ -912,15 +921,74 @@ static void *controller_thread_fn(void *arg)
 
 	while (!do_exit) {
 		safe_cond_wait(&s->hop, &s->hop_m);
-		if (s->freq_len <= 1) {
-			continue;}
+		if (s->freq_len <= 1 && mijenjam_frekvenciju == 0) {
+			continue;
+		}
+
+		fprintf(stderr,"Prosli smo safe_cond_wait, freq_len: %d\n",
+				s->freq_len);
 		/* hacky hopping */
-		s->freq_now = (s->freq_now + 1) % s->freq_len;
-		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
+		/* s->freq_now = (s->freq_now + 1) % s->freq_len; */
+		/* optimal_settings(s->freqs[s->freq_now], demod.rate_in); */
+
+		//moje
+		optimal_settings(s->freqs[s->freq_len - 1], demod.rate_in);
+		mijenjam_frekvenciju = 1;
+		//moje
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
+		fprintf(stderr, "Frekvencija postavljena na %d\n", dongle.freq);
 	}
 	return 0;
+}
+
+static void* socket_thread_fn(void *arg)
+{
+	int sockfd;
+	unsigned char buff[20] = {0};
+	struct sockaddr_in serv_addr;
+	int new_freq = 0;
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (sockfd < 0) {
+		fprintf(stderr, "Error opening socket, %d\n", errno);
+	}
+
+	bzero((char *) &serv_addr, sizeof(serv_addr));
+
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_addr.s_addr = INADDR_ANY;
+	serv_addr.sin_port = htons(PORT);
+
+	if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+		fprintf(stderr, "Error on binding!\n");
+	}
+
+	bzero(buff, 20);
+	fprintf(stderr, "Main socket started listening on port: %d!\n", PORT);
+
+	while (1) {
+		int ret = recv(sockfd, buff, sizeof(buff), 0);
+		if (ret < 0) {
+			fprintf(stderr, "Error while receviing packet, %d\n", errno);
+			return NULL;
+		}
+
+		fprintf(stderr, "Message from client: %s\n", buff);
+
+		int client_freq = strtol(&buff[0], NULL, 10);
+
+		controller.freqs[controller.freq_len] = client_freq;
+		controller.freq_len++;
+		controller.freq_len = controller.freq_len % FREQUENCIES_LIMIT;
+		mijenjam_frekvenciju = 1;
+
+		fprintf(stderr, "Pretvoreno %d\n", client_freq);
+
+		safe_cond_signal(&controller.hop, &controller.hop_m);
+		bzero(buff, 20);
+	}
+
 }
 
 void frequency_range(struct controller_state *s, char *arg)
@@ -1078,7 +1146,8 @@ int main(int argc, char **argv)
 				{frequency_range(&controller, optarg);}
 			else
 			{
-				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				controller.freqs[controller.freq_len] =
+							(uint32_t)atofs(optarg);
 				controller.freq_len++;
 			}
 			break;
@@ -1176,7 +1245,8 @@ int main(int argc, char **argv)
 	demod.rate_in *= demod.post_downsample;
 
 	if (!output.rate) {
-		output.rate = demod.rate_out;}
+		output.rate = demod.rate_out;
+	}
 
 	sanity_checks();
 
@@ -1217,7 +1287,8 @@ int main(int argc, char **argv)
 #endif
 
 	if (demod.deemph) {
-		demod.deemph_a = (int)round(1.0/((1.0-exp(-1.0/(demod.rate_out * 75e-6)))));
+		demod.deemph_a =
+		     (int)round(1.0/((1.0-exp(-1.0/(demod.rate_out * 75e-6)))));
 	}
 
 	/* Set the tuner gain */
@@ -1257,6 +1328,7 @@ int main(int argc, char **argv)
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+	pthread_create(&sock_thread, NULL, socket_thread_fn, NULL);
 
 	while (!do_exit) {
 		usleep(100000);
