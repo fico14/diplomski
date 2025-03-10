@@ -1349,7 +1349,8 @@ int main(int argc, char **argv)
 	pthread_join(output.thread, NULL);
 	safe_cond_signal(&controller.hop, &controller.hop_m);
 	pthread_join(controller.thread, NULL);
-	pthread_join(sock_thread, NULL);
+	//ovaj join je nepotreban jer samo uzrokuje deadlock
+	// pthread_join(sock_thread, NULL);
 	//dongle_cleanup(&dongle);
 	demod_cleanup(&demod);
 	output_cleanup(&output);
