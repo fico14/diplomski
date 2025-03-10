@@ -967,10 +967,10 @@ static void* socket_thread_fn(void *arg)
 	bzero(buff, 20);
 	fprintf(stderr, "Main socket started listening on port: %d!\n", PORT);
 
-	while (1) {
+	while (do_exit) {
 		int ret = recv(sockfd, buff, sizeof(buff), 0);
 		if (ret < 0) {
-			fprintf(stderr, "Error while receviing packet, %d\n", errno);
+			fprintf(stderr, "Error while receiving packet, %d\n", errno);
 			return NULL;
 		}
 
@@ -989,6 +989,8 @@ static void* socket_thread_fn(void *arg)
 		bzero(buff, 20);
 	}
 
+	close(sockfd);
+	return 0;
 }
 
 void frequency_range(struct controller_state *s, char *arg)
@@ -1347,7 +1349,7 @@ int main(int argc, char **argv)
 	pthread_join(output.thread, NULL);
 	safe_cond_signal(&controller.hop, &controller.hop_m);
 	pthread_join(controller.thread, NULL);
-
+	pthread_join(sock_thread, NULL);
 	//dongle_cleanup(&dongle);
 	demod_cleanup(&demod);
 	output_cleanup(&output);
