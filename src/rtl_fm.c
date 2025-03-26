@@ -58,6 +58,8 @@
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <termios.h>
+#include <fcntl.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -178,10 +180,10 @@ struct controller_state
 	pthread_mutex_t hop_m;
 };
 
-pthread_t sock_thread;
-#define PORT 	6020
-volatile int mijenjam_frekvenciju = 0;
+#define DEVICE 	"/dev/ttyUSB0"
 
+pthread_t sock_thread;
+volatile int mijenjam_frekvenciju = 0;
 // multiple of these, eventually
 struct dongle_state dongle;
 struct demod_state demod;
@@ -944,52 +946,83 @@ static void *controller_thread_fn(void *arg)
 
 static void* socket_thread_fn(void *arg)
 {
-	int sockfd;
-	unsigned char buff[20] = {0};
-	struct sockaddr_in serv_addr;
-	int new_freq = 0;
+	unsigned char buff[5] = {0};
+	int serial_fd;
+	struct termios tty;
 
-	sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sockfd < 0) {
-		fprintf(stderr, "Error opening socket, %d\n", errno);
+	serial_fd = open(DEVICE, O_RDWR);
+	if (serial_fd < 0) {
+		fprintf(stderr, "Error while opening device, %d\n", errno);
+		do_exit = 1;
+		return 0;
 	}
 
-	bzero((char *) &serv_addr, sizeof(serv_addr));
-
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_addr.s_addr = INADDR_ANY;
-	serv_addr.sin_port = htons(PORT);
-
-	if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-		fprintf(stderr, "Error on binding!\n");
+	if (tcgetattr(serial_fd, &tty) != 0) {
+		fprintf(stderr, "Error %d from tcgeetattr\n", errno);
+		return 0;
 	}
 
-	bzero(buff, 20);
-	fprintf(stderr, "Main socket started listening on port: %d!\n", PORT);
+	tty.c_cflag &= ~PARENB; // Clear parity bit, disabling parity
+	tty.c_cflag &= ~CSTOPB; // Clear stop field, only one stop bit used
+	tty.c_cflag &= ~CSIZE; // Clear all bits that set the data size
+	tty.c_cflag |= CS8; // 8 bits per byte (most common)
+	tty.c_cflag &= ~CRTSCTS;
+	tty.c_cflag |= CREAD | CLOCAL;
+
+	tty.c_lflag &= ~ICANON;
+	tty.c_lflag &= ~ECHO; // Disable echo
+	tty.c_lflag &= ~ECHOE; // Disable erasure
+	tty.c_lflag &= ~ECHONL; // Disable new-line echo
+	tty.c_lflag &= ~ISIG; // Disable interpretation of INTR, QUIT and SUSP
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow ctrl
+	tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
+
+	tty.c_oflag &= ~OPOST;
+	tty.c_oflag &= ~ONLCR;
+
+	tty.c_cc[VTIME] = 0;
+	tty.c_cc[VMIN] = 5;
+
+	cfsetispeed(&tty, B115200);
+
+        // Save tty settings, also checking for error
+        if (tcsetattr(serial_fd, TCSANOW, &tty) != 0) {
+                fprintf(stderr, "Error %d from tcsetattr\n", errno);
+                return 0;
+        }
+
+	fprintf(stderr, "Socket thread started listening on serial port\n");
 
 	while (!do_exit) {
-		int ret = recv(sockfd, buff, sizeof(buff), 0);
-		if (ret < 0) {
-			fprintf(stderr, "Error while receiving packet, %d\n", errno);
-			return NULL;
-		}
+		bzero(buff, 5);
 
-		fprintf(stderr, "Message from client: %s\n", buff);
+		int num_bytes = read(serial_fd, &buff, sizeof(buff));
+		if (num_bytes != 5)
+			continue;
 
-		int client_freq = strtol(&buff[0], NULL, 10);
+		fprintf(stderr, "Received bytes: %s", buff);
+		for(int i = 0; i < 5; i++)
+			fprintf(stderr, "%d", buff[i]);
 
-		controller.freqs[controller.freq_len] = client_freq;
-		controller.freq_len++;
-		controller.freq_len = controller.freq_len % FREQUENCIES_LIMIT;
-		mijenjam_frekvenciju = 1;
+		fprintf(stderr, "\n");
 
-		fprintf(stderr, "Pretvoreno %d\n", client_freq);
 
-		safe_cond_signal(&controller.hop, &controller.hop_m);
-		bzero(buff, 20);
+		/* if (buff[0] == 'f') { */
+		/* 	int client_freq = strtol(&buff[1], NULL, 10); */
+		/*  */
+		/* 	controller.freqs[controller.freq_len] = client_freq; */
+		/* 	controller.freq_len++; */
+		/* 	controller.freq_len = controller.freq_len % */
+		/* 				FREQUENCIES_LIMIT; */
+		/* 	mijenjam_frekvenciju = 1; */
+		/*  */
+		/* 	fprintf(stderr, "Pretvoreno %d\n", client_freq); */
+		/*  */
+		/* 	safe_cond_signal(&controller.hop, &controller.hop_m); */
+		/* } */
 	}
 
-	close(sockfd);
+	close(serial_fd);
 	return 0;
 }
 
