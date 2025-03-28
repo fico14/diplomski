@@ -180,7 +180,14 @@ struct controller_state
 	pthread_mutex_t hop_m;
 };
 
-#define DEVICE 	"/dev/ttyUSB0"
+#define DEVICE 		"/dev/ttyUSB0"
+#define BUFF_LEN 	5
+
+//demodulations
+#define AM 	1
+#define FM 	2
+#define LSB 	3
+#define USB 	4
 
 pthread_t sock_thread;
 volatile int mijenjam_frekvenciju = 0;
@@ -944,9 +951,43 @@ static void *controller_thread_fn(void *arg)
 	return 0;
 }
 
+static unsigned int chars_to_int(unsigned char* buf)
+{
+	int i;
+	unsigned int val = 0;
+
+	for(i=1; i<5; i++) {
+		val = val | ((buf[i]) << ((i-1)*8));
+	}
+
+	return val;
+}
+
+static void change_demod(int type)
+{
+	switch(type) {
+		case AM:
+			demod.mode_demod = &am_demod;
+			break;
+		case FM:
+			demod.mode_demod = &fm_demod;
+			break;
+		case USB:
+			demod.mode_demod = &usb_demod;
+			break;
+		case LSB:
+			demod.mode_demod = &lsb_demod;
+			break;
+		default:
+			fprintf(stderr, "Unknown demodulation: %d\n", demod);
+			break;
+	}
+}
+
 static void* socket_thread_fn(void *arg)
 {
-	unsigned char buff[5] = {0};
+	unsigned char buff[BUFF_LEN] = {0};
+	unsigned char last_buff[BUFF_LEN] = {0};
 	int serial_fd;
 	struct termios tty;
 
@@ -1000,26 +1041,50 @@ static void* socket_thread_fn(void *arg)
 		if (num_bytes != 5)
 			continue;
 
+		// Ako je trenutni buffer jednak proslom ignoriraj ga
+		// (enkoder ponekad posalje vise podataka nego sto treba)
+		if (strncmp(&buff[0], &last_buff[0], BUFF_LEN) == 0) {
+			continue;
+		}
+
+		strncpy(&last_buff[0], &buff[0], BUFF_LEN);
+		/* Debugiranje serije
 		fprintf(stderr, "Received bytes: %s", buff);
 		for(int i = 0; i < 5; i++)
 			fprintf(stderr, "%d", buff[i]);
 
 		fprintf(stderr, "\n");
+		*/
 
+		if (buff[0] == 'f') {
+			int client_freq = strtol(&buff[1], NULL, 4);
 
-		/* if (buff[0] == 'f') { */
-		/* 	int client_freq = strtol(&buff[1], NULL, 10); */
-		/*  */
-		/* 	controller.freqs[controller.freq_len] = client_freq; */
-		/* 	controller.freq_len++; */
-		/* 	controller.freq_len = controller.freq_len % */
-		/* 				FREQUENCIES_LIMIT; */
-		/* 	mijenjam_frekvenciju = 1; */
-		/*  */
-		/* 	fprintf(stderr, "Pretvoreno %d\n", client_freq); */
-		/*  */
-		/* 	safe_cond_signal(&controller.hop, &controller.hop_m); */
-		/* } */
+			controller.freqs[controller.freq_len] = client_freq;
+			controller.freq_len++;
+			controller.freq_len = controller.freq_len %
+						FREQUENCIES_LIMIT;
+			mijenjam_frekvenciju = 1;
+
+			fprintf(stderr, "Pretvoreno %d\n", client_freq);
+
+			safe_cond_signal(&controller.hop, &controller.hop_m);
+		} else if (buff[0] == 'd') {
+			// Change demodulation method
+			int demod = chars_to_int(buff);
+			change_demod(demod);
+		} else if (buff[0] == 'g') {
+			// Change gain level
+
+		} else if (buff[0] == 'a') {
+			// Change AGC mode
+			int agc_mode = chars_to_int(buff);
+			if (agc_mode == 0 || agc_mode == 1) {
+				fprintf(stderr, "Setting AGC to %d\n", agc_mode);
+				rtlsdr_set_agc_mode(dongle.dev, agc_mode);
+			} else {
+				fprintf(stderr, "Failed to set agc mode\n");
+			}
+		}
 	}
 
 	close(serial_fd);
