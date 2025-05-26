@@ -50,6 +50,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,6 +192,19 @@ struct controller_state
 
 pthread_t sock_thread;
 volatile int mijenjam_frekvenciju = 0;
+
+#define FIFO_LEN 	200
+#define MSG_SIZE 	5
+
+uint8_t msg_fifo[FIFO_LEN][MSG_SIZE];
+int read_ptr = 0;
+int write_ptr = 0;
+
+struct sync_util {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+};
+
 // multiple of these, eventually
 struct dongle_state dongle;
 struct demod_state demod;
@@ -934,8 +948,9 @@ static void *controller_thread_fn(void *arg)
 			continue;
 		}
 
-		fprintf(stderr,"Prosli smo safe_cond_wait, freq_len: %d\n",
-				s->freq_len);
+		/* fprintf(stderr,"Prosli smo safe_cond_wait, freq_len: %d\n", */
+		/* 		s->freq_len); */
+
 		/* hacky hopping */
 		/* s->freq_now = (s->freq_now + 1) % s->freq_len; */
 		/* optimal_settings(s->freqs[s->freq_now], demod.rate_in); */
@@ -946,18 +961,24 @@ static void *controller_thread_fn(void *arg)
 		//moje
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
-		fprintf(stderr, "Frekvencija postavljena na %d\n", dongle.freq);
+		fprintf(stderr, "Frekvencija postavljena na %d, "
+			"frek u polju: %d\n", dongle.freq,
+			s->freqs[s->freq_len - 1]);
 	}
 	return 0;
 }
 
-static unsigned int chars_to_int(unsigned char* buf)
+static uint32_t chars_to_int(unsigned char* buf)
 {
 	int i;
-	unsigned int val = 0;
+	uint32_t val = 0;
+
+	/* for(i=1; i<5; i++) { */
+	/* 	val = val | ((buf[i]) << ((i-1)*8)); */
+	/* } */
 
 	for(i=1; i<5; i++) {
-		val = val | ((buf[i]) << ((i-1)*8));
+		val = val | ((buf[i] & 0x000000ff) << ((4-i)*8));
 	}
 
 	return val;
@@ -979,16 +1000,70 @@ static void change_demod(int type)
 			demod.mode_demod = &lsb_demod;
 			break;
 		default:
-			fprintf(stderr, "Unknown demodulation: %d\n", demod);
+			fprintf(stderr, "Unknown demodulation: %d\n", type);
 			break;
 	}
 }
 
+/* static void* consumer_thread_fn(void *arg) */
+/* { */
+/* 	struct sync_util *syn = arg; */
+/* 	uint8_t buff[5] = {0}; */
+/*  */
+/* 	while(1) { */
+/* 		pthread_mutex_lock(&syn->lock); */
+/* 		while(read_ptr == write_ptr) */
+/* 			pthread_cond_wait(&syn->cond, &syn->lock); */
+/*  */
+/* 		fprintf(stderr, "Podatak na obradi, w:%d, r:%d\n", write_ptr, */
+/* 								read_ptr); */
+/* 		memcpy(buff, msg_fifo[read_ptr&FIFO_LEN], MSG_SIZE); */
+/* 		read_ptr++; */
+/*  */
+/* 		if (buff[0] == 'f') { */
+/* 			uint32_t client_freq = chars_to_int(buff); */
+/*  */
+/* 			controller.freqs[controller.freq_len] = client_freq; */
+/* 			controller.freq_len++; */
+/* 			controller.freq_len = controller.freq_len % */
+/* 						FREQUENCIES_LIMIT; */
+/* 			mijenjam_frekvenciju = 1; */
+
+			//fprintf(stderr, "Pretvoreno %d\n", client_freq);
+/*  */
+/* 			safe_cond_signal(&controller.hop, &controller.hop_m); */
+/* 		} else if (buff[0] == 'm') { */
+/* 			// Change demodulation method */
+/* 			int demod = chars_to_int(buff); */
+/* 			change_demod(demod); */
+/* 		} else if (buff[0] == 'g') { */
+/* 			// Change gain level */
+/*  */
+/* 		} else if (buff[0] == 'a') { */
+/* 			// Change AGC mode */
+/* 			int agc_mode = chars_to_int(buff); */
+/* 			if (agc_mode == 0 || agc_mode == 1) { */
+/* 				fprintf(stderr, "Setting AGC to %d\n", agc_mode); */
+/* 				rtlsdr_set_agc_mode(dongle.dev, agc_mode); */
+/* 			} else { */
+/* 				fprintf(stderr, "Failed to set agc mode\n"); */
+/* 			} */
+/* 		} */
+/*  */
+/* 		pthread_mutex_unlock(&syn->lock); */
+/* 	} */
+/*  */
+/* 	return NULL; */
+/* } */
+
 static void* socket_thread_fn(void *arg)
 {
-	unsigned char buff[BUFF_LEN] = {0};
-	unsigned char last_buff[BUFF_LEN] = {0};
+	uint8_t buff[BUFF_LEN] = {0};
+	uint8_t last_buff[BUFF_LEN] = {0};
 	int serial_fd;
+	int num_bytes = 0;
+	/* pthread_t consumer; */
+	/* struct sync_util syn; */
 	struct termios tty;
 
 	serial_fd = open(DEVICE, O_RDWR);
@@ -1032,32 +1107,63 @@ static void* socket_thread_fn(void *arg)
                 return 0;
         }
 
-	fprintf(stderr, "Socket thread started listening on serial port\n");
+	sleep(2); //required to make flush work, for some reason
+	tcflush(serial_fd,TCIOFLUSH);
+
+	fprintf(stderr, "Serial thread started listening on serial port: %s, "
+			"baud rate: 115200 bit/s\n", DEVICE);
+
+	/* pthread_mutex_init(&syn.lock, NULL); */
+	/* pthread_cond_init(&syn.cond, NULL); */
+	/* pthread_create(&consumer, NULL, consumer_thread_fn, &syn); */
+
+	/*
+	 * Zero out FIFO content!!!!
+	 */
+	for(int i = 0; i < FIFO_LEN; i++)
+		for (int j = 0; j < MSG_SIZE; j++)
+			msg_fifo[i][j] = 0;
+
 
 	while (!do_exit) {
 		bzero(buff, 5);
 
-		int num_bytes = read(serial_fd, &buff, sizeof(buff));
-		if (num_bytes != 5)
-			continue;
-
-		// Ako je trenutni buffer jednak proslom ignoriraj ga
-		// (enkoder ponekad posalje vise podataka nego sto treba)
-		if (strncmp(&buff[0], &last_buff[0], BUFF_LEN) == 0) {
+		num_bytes = read(serial_fd, &buff, sizeof(buff));
+		if (num_bytes != 5) {
+			fprintf(stderr, "Nedovoljno podataka, %d\n", num_bytes);
 			continue;
 		}
 
-		strncpy(&last_buff[0], &buff[0], BUFF_LEN);
-		/* Debugiranje serije
-		fprintf(stderr, "Received bytes: %s", buff);
+		// Ako je trenutni buffer jednak proslom ignoriraj ga
+		// (enkoder ponekad posalje vise podataka nego sto treba)
+		if (memcmp(&buff[0], &last_buff[0], BUFF_LEN) == 0) {
+			fprintf(stderr, "Podatak isti kao prosli\n");
+			for(int i = 0; i < 5; i++)
+				fprintf(stderr, "%d, ", buff[i]);
+
+			fprintf(stderr, "\n");
+			continue;
+		}
+
+		memcpy(&last_buff[0], &buff[0], BUFF_LEN);
+		/* Debugiranje serije*/
+		fprintf(stderr, "----Primljeno: %c_%d\n", buff[0], chars_to_int(buff));
+		fprintf(stderr, "Received bytes: %s;", buff);
 		for(int i = 0; i < 5; i++)
-			fprintf(stderr, "%d", buff[i]);
+			fprintf(stderr, "%d, ", buff[i]);
 
 		fprintf(stderr, "\n");
-		*/
+
+		/* pthread_mutex_lock(&syn.lock); */
+		/* memcpy(msg_fifo[write_ptr%FIFO_LEN], buff, 5); */
+		/* write_ptr++; */
+		/* pthread_cond_signal(&syn.cond); */
+		/* pthread_mutex_unlock(&syn.lock); */
+
+		/* fprintf(stderr, "Podatak poslan\n"); */
 
 		if (buff[0] == 'f') {
-			int client_freq = strtol(&buff[1], NULL, 4);
+			uint32_t client_freq = chars_to_int(buff);
 
 			controller.freqs[controller.freq_len] = client_freq;
 			controller.freq_len++;
@@ -1068,7 +1174,7 @@ static void* socket_thread_fn(void *arg)
 			fprintf(stderr, "Pretvoreno %d\n", client_freq);
 
 			safe_cond_signal(&controller.hop, &controller.hop_m);
-		} else if (buff[0] == 'd') {
+		} else if (buff[0] == 'm') {
 			// Change demodulation method
 			int demod = chars_to_int(buff);
 			change_demod(demod);
@@ -1087,6 +1193,9 @@ static void* socket_thread_fn(void *arg)
 		}
 	}
 
+	/* pthread_join(consumer, NULL); */
+	/* pthread_mutex_destroy(&syn.lock); */
+	/* pthread_cond_destroy(&syn.cond); */
 	close(serial_fd);
 	return 0;
 }
@@ -1227,7 +1336,7 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int custom_ppm = 0;
-    int enable_biastee = 0;
+	int enable_biastee = 0;
 	dongle_init(&dongle);
 	demod_init(&demod);
 	output_init(&output);
@@ -1447,8 +1556,6 @@ int main(int argc, char **argv)
 	pthread_join(output.thread, NULL);
 	safe_cond_signal(&controller.hop, &controller.hop_m);
 	pthread_join(controller.thread, NULL);
-	//ovaj join je nepotreban jer samo uzrokuje deadlock
-	// pthread_join(sock_thread, NULL);
 	//dongle_cleanup(&dongle);
 	demod_cleanup(&demod);
 	output_cleanup(&output);
